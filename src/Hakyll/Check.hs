@@ -196,8 +196,7 @@ checkExternalUrl :: String -> Checker ()
 checkExternalUrl url = do
     logger     <- checkerLogger           <$> ask
     needsCheck <- (== All) . checkerCheck <$> ask
-    checked    <- (url `S.member`)        <$> get
-
+    checked    <- (urlToCheck `S.member`)        <$> get
     if not needsCheck || checked
         then Logger.debug logger "Already checked, skipping"
         else do
@@ -208,10 +207,7 @@ checkExternalUrl url = do
                     response <- Http.http (settings request) mgr
                     let code = Http.statusCode (Http.responseStatus response)
                     return $ code >= 200 && code < 300
-
-            modify $ if schemeRelative url
-                         then S.insert urlToCheck . S.insert url
-                         else S.insert url
+            modify $ S.insert urlToCheck
             case result of
                 Left (SomeException e) ->
                     case (cast e :: Maybe SomeAsyncException) of
