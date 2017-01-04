@@ -196,17 +196,11 @@ checkExternalUrl :: String -> Checker ()
 checkExternalUrl url = do
     logger     <- checkerLogger           <$> ask
     needsCheck <- (== All) . checkerCheck <$> ask
-    checked    <- (urlToCheck `S.member`)        <$> get
+    checked    <- (urlToCheck `S.member`) <$> get
     if not needsCheck || checked
         then Logger.debug logger "Already checked, skipping"
         else do
-            result <- liftIO $ try $ do
-                mgr <- Http.newManager Http.tlsManagerSettings
-                runResourceT $ do
-                    request  <- Http.parseRequest urlToCheck
-                    response <- Http.http (settings request) mgr
-                    let code = Http.statusCode (Http.responseStatus response)
-                    return $ code >= 200 && code < 300
+            result <- liftIO $ requestExternalUrl urlToCheck
             modify $ S.insert urlToCheck
             case result of
                 Left (SomeException e) ->
@@ -215,17 +209,6 @@ checkExternalUrl url = do
                         _ -> faulty url (Just $ showException e)
                 Right _ -> ok url
   where
-    -- Add additional request info
-    settings r = r
-        { Http.method         = "HEAD"
-        , Http.redirectCount  = 10
-        , Http.requestHeaders = ("User-Agent", ua) : Http.requestHeaders r
-        }
-
-    -- Nice user agent info
-    ua = fromString $ "hakyll-check/" ++
-        (intercalate "." $ map show $ versionBranch $ Paths_hakyll.version)
-
     -- Check scheme-relative links
     schemeRelative = isPrefixOf "//"
     urlToCheck     = if schemeRelative url then "http:" ++ url else url
@@ -239,6 +222,27 @@ checkExternalUrl _ = return ()
 #endif
 
 
+--------------------------------------------------------------------------------
+
+requestExternalUrl :: String -> IO (Either SomeException Bool)
+requestExternalUrl urlToCheck = try $ do
+  mgr <- Http.newManager Http.tlsManagerSettings
+  runResourceT $ do
+    request  <- Http.parseRequest urlToCheck
+    response <- Http.http (settings request) mgr
+    let code = Http.statusCode (Http.responseStatus response)
+    return $ code >= 200 && code < 300
+  where
+    -- Add additional request info
+    settings r = r
+        { Http.method         = "HEAD"
+        , Http.redirectCount  = 10
+        , Http.requestHeaders = ("User-Agent", ua) : Http.requestHeaders r
+        }
+
+    -- Nice user agent info
+    ua = fromString $ "hakyll-check/" ++
+        (intercalate "." $ map show $ versionBranch $ Paths_hakyll.version)
 
 --------------------------------------------------------------------------------
 -- | Wraps doesFileExist, also checks for index.html
