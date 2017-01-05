@@ -24,7 +24,6 @@ import           System.FilePath              (takeDirectory, takeExtension,
 import qualified Text.HTML.TagSoup            as TS
 import Control.Concurrent.MVar                (MVar, newEmptyMVar, putMVar, readMVar)
 
-
 --------------------------------------------------------------------------------
 #ifdef CHECK_EXTERNAL
 import           Control.Exception            (SomeAsyncException (..),
@@ -57,7 +56,7 @@ data Check = All | InternalLinks
 check :: Configuration -> Logger -> Check -> IO ExitCode
 check config logger check' = do
     ((), state) <- runChecker checkDestination config logger check'
-    failed <- failedLinks state
+    failed <- countFailedLinks state
     if failed > 0 then return ( ExitFailure 1) else return ExitSuccess
 
 
@@ -130,49 +129,74 @@ checkFile filePath = do
     forM_ urls $ \url -> do
         Logger.debug logger $ "Checking link " ++ url
         m <- liftIO newEmptyMVar
-        checkUrl filePath url m
-
+        checkUrlIfNeeded filePath (canonicalizeUrl url) m
+    where
+      -- Check scheme-relative links
+      canonicalizeUrl url = if schemeRelative url then "http:" ++ url else url
+      schemeRelative = isPrefixOf "//"
 
 --------------------------------------------------------------------------------
-checkUrl :: FilePath -> String -> MVar CheckerWrite -> Checker ()
-checkUrl filePath url m
-    | isExternal url  = checkExternalUrl url m
-    | hasProtocol url = skip "Unknown protocol, skipping" url m
-    | otherwise       = checkInternalUrl filePath url m
+checkUrlIfNeeded :: FilePath -> String -> MVar CheckerWrite -> Checker ()
+checkUrlIfNeeded filepath url m = do
+  logger     <- checkerLogger           <$> ask
+  needsCheck <- (== All) . checkerCheck <$> ask
+  checked    <- (url `M.member`)        <$> get
+  if not needsCheck || checked
+        then Logger.debug logger "Already checked, skipping" 
+        else do modify $ M.insert url m
+                checkUrl filepath url
+
+--------------------------------------------------------------------------------
+checkUrl :: FilePath -> String -> Checker ()
+checkUrl filePath url
+  | isExternal url = checkExternalUrl url 
+  | hasProtocol url = skip "Unknown protocol, skipping" url
+  | otherwise = checkInternalUrl filePath url 
   where
     validProtoChars = ['A'..'Z'] ++ ['a'..'z'] ++ ['0'..'9'] ++ "+-."
     hasProtocol str = case break (== ':') str of
         (proto, ':' : _) -> all (`elem` validProtoChars) proto
         _                -> False
 
+      
+--------------------------------------------------------------------------------
+ok :: String  -> Checker ()
+ok url = putCheckResult url mempty {checkerOk = 1}
 
 --------------------------------------------------------------------------------
-ok :: String -> MVar CheckerWrite -> Checker ()
-ok url m = liftIO $ putMVar m mempty {checkerOk = 1}
-
-
---------------------------------------------------------------------------------
-skip :: String -> String -> MVar CheckerWrite -> Checker ()
-skip reason url m = do
+skip :: String -> String -> Checker ()
+skip reason url = do
     logger <- checkerLogger <$> ask
-    Logger.debug logger $ reason
-    liftIO $ putMVar m mempty {checkerOk = 1}
+    Logger.debug logger reason
+    putCheckResult url mempty {checkerOk = 1}
 
 --------------------------------------------------------------------------------
-faulty :: String -> Maybe String -> MVar CheckerWrite -> Checker ()
-faulty url reason m = do
+faulty :: String -> Maybe String -> Checker ()
+faulty url reason = do
     logger <- checkerLogger <$> ask
     Logger.error logger $ "Broken link to " ++ show url ++ explanation
-    liftIO $ putMVar m mempty {checkerFaulty = 1}
+    putCheckResult url mempty {checkerFaulty = 1}
   where
     formatExplanation = (" (" ++) . (++ ")")
     explanation = maybe "" formatExplanation reason
 
 
 --------------------------------------------------------------------------------
-checkInternalUrl :: FilePath -> String -> MVar CheckerWrite -> Checker ()
-checkInternalUrl base url m = case url' of
-    "" -> ok url m
+putCheckResult :: String -> CheckerWrite -> Checker ()
+putCheckResult url result = do
+  state <- get
+  let maybeMVar = M.lookup url state
+  case maybeMVar of
+    Just m -> liftIO $ putMVar m result
+    Nothing -> do
+      logger <- checkerLogger <$> ask
+      Logger.debug logger "Failed to find existing entry for checked URL"
+
+
+--------------------------------------------------------------------------------
+checkInternalUrl :: FilePath -> String -> Checker ()
+checkInternalUrl base url = case url' of
+    "" -> ok url
     _  -> do
         config <- checkerConfig <$> ask
         let dest = destinationDirectory config
@@ -182,34 +206,23 @@ checkInternalUrl base url m = case url' of
                 | otherwise             = dir </> url'
 
         exists <- checkFileExists filePath
-        if exists then ok url m else faulty url Nothing m
+        if exists then ok url else faulty url Nothing
   where
     url' = stripFragments $ unEscapeString url
 
 
 --------------------------------------------------------------------------------
-checkExternalUrl :: String -> MVar CheckerWrite -> Checker ()
+checkExternalUrl :: String -> Checker ()
 #ifdef CHECK_EXTERNAL
-checkExternalUrl url m = do
-    logger     <- checkerLogger           <$> ask
-    needsCheck <- (== All) . checkerCheck <$> ask
-    checked    <- (urlToCheck `M.member`) <$> get
-    if not needsCheck || checked
-        then Logger.debug logger "Already checked, skipping"
-        else do
-            result <- requestExternalUrl urlToCheck
-            modify $ M.insert urlToCheck m
-            case result of
-                Left (SomeException e) ->
-                    case (cast e :: Maybe SomeAsyncException) of
-                        Just ae -> throw ae
-                        _ -> faulty url (Just $ showException e) m
-                Right _ -> ok url m
+checkExternalUrl url = do
+    result <- requestExternalUrl url
+    case result of
+      Left (SomeException e) ->
+        case (cast e :: Maybe SomeAsyncException) of
+          Just ae -> throw ae
+          _ -> faulty url (Just $ showException e)
+      Right _ -> ok url
   where
-    -- Check scheme-relative links
-    schemeRelative = isPrefixOf "//"
-    urlToCheck     = if schemeRelative url then "http:" ++ url else url
-
     -- Convert exception to a concise form
     showException e = case cast e of
         Just (Http.HttpExceptionRequest _ e') -> show e'
@@ -239,7 +252,7 @@ requestExternalUrl urlToCheck = liftIO $ try $ do
 
     -- Nice user agent info
     ua = fromString $ "hakyll-check/" ++
-        (intercalate "." $ map show $ versionBranch $ Paths_hakyll.version)
+        (intercalate "." $ map show $ versionBranch Paths_hakyll.version)
 
 --------------------------------------------------------------------------------
 -- | Wraps doesFileExist, also checks for index.html
@@ -259,8 +272,8 @@ stripFragments = takeWhile (not . flip elem ['?', '#'])
 
 
 --------------------------------------------------------------------------------
-failedLinks :: CheckerState -> IO Int
-failedLinks state = foldM addIfFailure 0 (M.elems state)
+countFailedLinks :: CheckerState -> IO Int
+countFailedLinks state = foldM addIfFailure 0 (M.elems state)
   where addIfFailure f mvar = do
           cwrite <- readMVar mvar
-          return $ f + (checkerFaulty cwrite)
+          return $ f + checkerFaulty cwrite
