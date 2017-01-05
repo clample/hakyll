@@ -91,6 +91,10 @@ type Checker a = ReaderT CheckerRead (StateT CheckerState IO) a
 
 
 --------------------------------------------------------------------------------
+type URL = String
+
+
+--------------------------------------------------------------------------------
 runChecker :: Checker a -> Configuration -> Logger -> Check
            -> IO (a, CheckerState)
 runChecker checker config logger check' = do
@@ -136,7 +140,7 @@ checkFile filePath = do
       schemeRelative = isPrefixOf "//"
 
 --------------------------------------------------------------------------------
-checkUrlIfNeeded :: FilePath -> String -> MVar CheckerWrite -> Checker ()
+checkUrlIfNeeded :: FilePath -> URL -> MVar CheckerWrite -> Checker ()
 checkUrlIfNeeded filepath url m = do
   logger     <- checkerLogger           <$> ask
   needsCheck <- (== All) . checkerCheck <$> ask
@@ -147,7 +151,7 @@ checkUrlIfNeeded filepath url m = do
                 checkUrl filepath url
 
 --------------------------------------------------------------------------------
-checkUrl :: FilePath -> String -> Checker ()
+checkUrl :: FilePath -> URL -> Checker ()
 checkUrl filePath url
   | isExternal url = checkExternalUrl url 
   | hasProtocol url = skip "Unknown protocol, skipping" url
@@ -160,18 +164,18 @@ checkUrl filePath url
 
       
 --------------------------------------------------------------------------------
-ok :: String  -> Checker ()
+ok :: URL -> Checker ()
 ok url = putCheckResult url mempty {checkerOk = 1}
 
 --------------------------------------------------------------------------------
-skip :: String -> String -> Checker ()
+skip :: String -> URL -> Checker ()
 skip reason url = do
     logger <- checkerLogger <$> ask
     Logger.debug logger reason
     putCheckResult url mempty {checkerOk = 1}
 
 --------------------------------------------------------------------------------
-faulty :: String -> Maybe String -> Checker ()
+faulty :: URL -> Maybe String -> Checker ()
 faulty url reason = do
     logger <- checkerLogger <$> ask
     Logger.error logger $ "Broken link to " ++ show url ++ explanation
@@ -182,7 +186,7 @@ faulty url reason = do
 
 
 --------------------------------------------------------------------------------
-putCheckResult :: String -> CheckerWrite -> Checker ()
+putCheckResult :: URL -> CheckerWrite -> Checker ()
 putCheckResult url result = do
   state <- get
   let maybeMVar = M.lookup url state
@@ -194,7 +198,7 @@ putCheckResult url result = do
 
 
 --------------------------------------------------------------------------------
-checkInternalUrl :: FilePath -> String -> Checker ()
+checkInternalUrl :: FilePath -> URL -> Checker ()
 checkInternalUrl base url = case url' of
     "" -> ok url
     _  -> do
@@ -212,7 +216,7 @@ checkInternalUrl base url = case url' of
 
 
 --------------------------------------------------------------------------------
-checkExternalUrl :: String -> Checker ()
+checkExternalUrl :: URL -> Checker ()
 #ifdef CHECK_EXTERNAL
 checkExternalUrl url = do
     result <- requestExternalUrl url
@@ -234,11 +238,11 @@ checkExternalUrl _ = return ()
 
 --------------------------------------------------------------------------------
 
-requestExternalUrl :: String -> Checker (Either SomeException Bool)
-requestExternalUrl urlToCheck = liftIO $ try $ do
+requestExternalUrl :: URL -> Checker (Either SomeException Bool)
+requestExternalUrl url = liftIO $ try $ do
   mgr <- Http.newManager Http.tlsManagerSettings
   runResourceT $ do
-    request  <- Http.parseRequest urlToCheck
+    request  <- Http.parseRequest url
     response <- Http.http (settings request) mgr
     let code = Http.statusCode (Http.responseStatus response)
     return $ code >= 200 && code < 300
