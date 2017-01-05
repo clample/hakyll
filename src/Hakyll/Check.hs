@@ -61,6 +61,14 @@ check config logger check' = do
 
 
 --------------------------------------------------------------------------------
+countFailedLinks :: CheckerState -> IO Int
+countFailedLinks state = foldM addIfFailure 0 (M.elems state)
+  where addIfFailure f mvar = do
+          cwrite <- readMVar mvar
+          return $ f + checkerFaulty cwrite
+
+          
+--------------------------------------------------------------------------------
 data CheckerRead = CheckerRead
     { checkerConfig :: Configuration
     , checkerLogger :: Logger
@@ -139,6 +147,7 @@ checkFile filePath = do
       canonicalizeUrl url = if schemeRelative url then "http:" ++ url else url
       schemeRelative = isPrefixOf "//"
 
+
 --------------------------------------------------------------------------------
 checkUrlIfNeeded :: FilePath -> URL -> MVar CheckerWrite -> Checker ()
 checkUrlIfNeeded filepath url m = do
@@ -150,11 +159,12 @@ checkUrlIfNeeded filepath url m = do
         else do modify $ M.insert url m
                 checkUrl filepath url
 
+
 --------------------------------------------------------------------------------
 checkUrl :: FilePath -> URL -> Checker ()
 checkUrl filePath url
   | isExternal url = checkExternalUrl url 
-  | hasProtocol url = skip "Unknown protocol, skipping" url
+  | hasProtocol url = skip url $ Just "Unknown protocol, skipping"
   | otherwise = checkInternalUrl filePath url 
   where
     validProtoChars = ['A'..'Z'] ++ ['a'..'z'] ++ ['0'..'9'] ++ "+-."
@@ -167,12 +177,16 @@ checkUrl filePath url
 ok :: URL -> Checker ()
 ok url = putCheckResult url mempty {checkerOk = 1}
 
+
 --------------------------------------------------------------------------------
-skip :: String -> URL -> Checker ()
-skip reason url = do
+skip :: URL -> Maybe String -> Checker ()
+skip url maybeReason = do
     logger <- checkerLogger <$> ask
-    Logger.debug logger reason
+    case maybeReason of
+      Nothing -> return ()
+      Just reason -> Logger.debug logger reason
     putCheckResult url mempty {checkerOk = 1}
+
 
 --------------------------------------------------------------------------------
 faulty :: URL -> Maybe String -> Checker ()
@@ -232,12 +246,11 @@ checkExternalUrl url = do
         Just (Http.HttpExceptionRequest _ e') -> show e'
         _ -> head $ words $ show e
 #else
-checkExternalUrl _ = return ()
+checkExternalUrl url = skip url Nothing
 #endif
 
 
 --------------------------------------------------------------------------------
-
 requestExternalUrl :: URL -> Checker (Either SomeException Bool)
 requestExternalUrl url = liftIO $ try $ do
   mgr <- Http.newManager Http.tlsManagerSettings
@@ -258,6 +271,7 @@ requestExternalUrl url = liftIO $ try $ do
     ua = fromString $ "hakyll-check/" ++
         (intercalate "." $ map show $ versionBranch Paths_hakyll.version)
 
+
 --------------------------------------------------------------------------------
 -- | Wraps doesFileExist, also checks for index.html
 checkFileExists :: FilePath -> Checker Bool
@@ -274,10 +288,3 @@ checkFileExists filePath = liftIO $ do
 stripFragments :: String -> String
 stripFragments = takeWhile (not . flip elem ['?', '#'])
 
-
---------------------------------------------------------------------------------
-countFailedLinks :: CheckerState -> IO Int
-countFailedLinks state = foldM addIfFailure 0 (M.elems state)
-  where addIfFailure f mvar = do
-          cwrite <- readMVar mvar
-          return $ f + checkerFaulty cwrite
