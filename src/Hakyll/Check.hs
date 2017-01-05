@@ -14,15 +14,17 @@ import           Control.Monad.Trans          (liftIO)
 import           Control.Monad.Trans.Resource (runResourceT)
 import           Data.ByteString.Char8        (unpack)
 import           Data.List                    (isPrefixOf)
-import qualified Data.Map.Lazy                as M
+import qualified Data.Map.Lazy                as Map
 import           Network.URI                  (unEscapeString)
 import           System.Directory             (doesDirectoryExist,
                                                doesFileExist)
 import           System.Exit                  (ExitCode (..))
 import           System.FilePath              (takeDirectory, takeExtension,
                                                (</>))
+import           Control.Concurrent.MVar      (MVar, newEmptyMVar, putMVar,
+                                               readMVar)
 import qualified Text.HTML.TagSoup            as TS
-import Control.Concurrent.MVar                (MVar, newEmptyMVar, putMVar, readMVar)
+
 
 --------------------------------------------------------------------------------
 #ifdef CHECK_EXTERNAL
@@ -62,12 +64,12 @@ check config logger check' = do
 
 --------------------------------------------------------------------------------
 countFailedLinks :: CheckerState -> IO Int
-countFailedLinks state = foldM addIfFailure 0 (M.elems state)
-  where addIfFailure f mvar = do
-          cwrite <- readMVar mvar
-          return $ f + checkerFaulty cwrite
+countFailedLinks state = foldM addIfFailure 0 (Map.elems state)
+    where addIfFailure f mvar = do
+              cwrite <- readMVar mvar
+              return $ f + checkerFaulty cwrite
 
-          
+
 --------------------------------------------------------------------------------
 data CheckerRead = CheckerRead
     { checkerConfig :: Configuration
@@ -91,7 +93,7 @@ instance Monoid CheckerWrite where
 
 
 --------------------------------------------------------------------------------
-type CheckerState = M.Map String (MVar CheckerWrite)
+type CheckerState = Map.Map String (MVar CheckerWrite)
 
 
 --------------------------------------------------------------------------------
@@ -111,7 +113,7 @@ runChecker checker config logger check' = do
                     , checkerLogger = logger
                     , checkerCheck  = check'
                     }
-    runStateT (runReaderT checker read') M.empty
+    runStateT (runReaderT checker read') Map.empty
 
 
 --------------------------------------------------------------------------------
@@ -143,36 +145,36 @@ checkFile filePath = do
         m <- liftIO newEmptyMVar
         checkUrlIfNeeded filePath (canonicalizeUrl url) m
     where
-      -- Check scheme-relative links
-      canonicalizeUrl url = if schemeRelative url then "http:" ++ url else url
-      schemeRelative = isPrefixOf "//"
+        -- Check scheme-relative links
+        canonicalizeUrl url = if schemeRelative url then "http:" ++ url else url
+        schemeRelative = isPrefixOf "//"
 
 
 --------------------------------------------------------------------------------
 checkUrlIfNeeded :: FilePath -> URL -> MVar CheckerWrite -> Checker ()
 checkUrlIfNeeded filepath url m = do
-  logger     <- checkerLogger           <$> ask
-  needsCheck <- (== All) . checkerCheck <$> ask
-  checked    <- (url `M.member`)        <$> get
-  if not needsCheck || checked
-        then Logger.debug logger "Already checked, skipping" 
-        else do modify $ M.insert url m
+    logger     <- checkerLogger           <$> ask
+    needsCheck <- (== All) . checkerCheck <$> ask
+    checked    <- (url `Map.member`)      <$> get
+    if not needsCheck || checked
+        then Logger.debug logger "Already checked, skipping"
+        else do modify $ Map.insert url m
                 checkUrl filepath url
 
 
 --------------------------------------------------------------------------------
 checkUrl :: FilePath -> URL -> Checker ()
 checkUrl filePath url
-  | isExternal url = checkExternalUrl url 
-  | hasProtocol url = skip url $ Just "Unknown protocol, skipping"
-  | otherwise = checkInternalUrl filePath url 
-  where
-    validProtoChars = ['A'..'Z'] ++ ['a'..'z'] ++ ['0'..'9'] ++ "+-."
-    hasProtocol str = case break (== ':') str of
-        (proto, ':' : _) -> all (`elem` validProtoChars) proto
-        _                -> False
+    | isExternal url = checkExternalUrl url
+    | hasProtocol url = skip url $ Just "Unknown protocol, skipping"
+    | otherwise = checkInternalUrl filePath url
+    where
+        validProtoChars = ['A'..'Z'] ++ ['a'..'z'] ++ ['0'..'9'] ++ "+-."
+        hasProtocol str = case break (== ':') str of
+            (proto, ':' : _) -> all (`elem` validProtoChars) proto
+            _                -> False
 
-      
+
 --------------------------------------------------------------------------------
 ok :: URL -> Checker ()
 ok url = putCheckResult url mempty {checkerOk = 1}
@@ -183,8 +185,8 @@ skip :: URL -> Maybe String -> Checker ()
 skip url maybeReason = do
     logger <- checkerLogger <$> ask
     case maybeReason of
-      Nothing -> return ()
-      Just reason -> Logger.debug logger reason
+        Nothing -> return ()
+        Just reason -> Logger.debug logger reason
     putCheckResult url mempty {checkerOk = 1}
 
 
@@ -194,21 +196,21 @@ faulty url reason = do
     logger <- checkerLogger <$> ask
     Logger.error logger $ "Broken link to " ++ show url ++ explanation
     putCheckResult url mempty {checkerFaulty = 1}
-  where
-    formatExplanation = (" (" ++) . (++ ")")
-    explanation = maybe "" formatExplanation reason
+    where
+        formatExplanation = (" (" ++) . (++ ")")
+        explanation = maybe "" formatExplanation reason
 
 
 --------------------------------------------------------------------------------
 putCheckResult :: URL -> CheckerWrite -> Checker ()
 putCheckResult url result = do
-  state <- get
-  let maybeMVar = M.lookup url state
-  case maybeMVar of
-    Just m -> liftIO $ putMVar m result
-    Nothing -> do
-      logger <- checkerLogger <$> ask
-      Logger.debug logger "Failed to find existing entry for checked URL"
+    state <- get
+    let maybeMVar = Map.lookup url state
+    case maybeMVar of
+        Just m -> liftIO $ putMVar m result
+        Nothing -> do
+            logger <- checkerLogger <$> ask
+            Logger.debug logger "Failed to find existing entry for checked URL"
 
 
 --------------------------------------------------------------------------------
@@ -225,8 +227,8 @@ checkInternalUrl base url = case url' of
 
         exists <- checkFileExists filePath
         if exists then ok url else faulty url Nothing
-  where
-    url' = stripFragments $ unEscapeString url
+    where
+        url' = stripFragments $ unEscapeString url
 
 
 --------------------------------------------------------------------------------
@@ -235,16 +237,16 @@ checkExternalUrl :: URL -> Checker ()
 checkExternalUrl url = do
     result <- requestExternalUrl url
     case result of
-      Left (SomeException e) ->
-        case (cast e :: Maybe SomeAsyncException) of
-          Just ae -> throw ae
-          _ -> faulty url (Just $ showException e)
-      Right _ -> ok url
-  where
-    -- Convert exception to a concise form
-    showException e = case cast e of
-        Just (Http.HttpExceptionRequest _ e') -> show e'
-        _ -> head $ words $ show e
+        Left (SomeException e) ->
+            case (cast e :: Maybe SomeAsyncException) of
+                Just ae -> throw ae
+                _ -> faulty url (Just $ showException e)
+        Right _ -> ok url
+    where
+        -- Convert exception to a concise form
+        showException e = case cast e of
+            Just (Http.HttpExceptionRequest _ e') -> show e'
+            _ -> head $ words $ show e
 #else
 checkExternalUrl url = skip url Nothing
 #endif
@@ -253,23 +255,23 @@ checkExternalUrl url = skip url Nothing
 --------------------------------------------------------------------------------
 requestExternalUrl :: URL -> Checker (Either SomeException Bool)
 requestExternalUrl url = liftIO $ try $ do
-  mgr <- Http.newManager Http.tlsManagerSettings
-  runResourceT $ do
-    request  <- Http.parseRequest url
-    response <- Http.http (settings request) mgr
-    let code = Http.statusCode (Http.responseStatus response)
-    return $ code >= 200 && code < 300
-  where
-    -- Add additional request info
-    settings r = r
-        { Http.method         = "HEAD"
-        , Http.redirectCount  = 10
-        , Http.requestHeaders = ("User-Agent", ua) : Http.requestHeaders r
-        }
+    mgr <- Http.newManager Http.tlsManagerSettings
+    runResourceT $ do
+        request  <- Http.parseRequest url
+        response <- Http.http (settings request) mgr
+        let code = Http.statusCode (Http.responseStatus response)
+        return $ code >= 200 && code < 300
+    where
+        -- Add additional request info
+        settings r = r
+            { Http.method         = "HEAD"
+            , Http.redirectCount  = 10
+            , Http.requestHeaders = ("User-Agent", ua) : Http.requestHeaders r
+            }
 
-    -- Nice user agent info
-    ua = fromString $ "hakyll-check/" ++
-        (intercalate "." $ map show $ versionBranch Paths_hakyll.version)
+        -- Nice user agent info
+        ua = fromString $ "hakyll-check/" ++
+             (intercalate "." $ map show $ versionBranch Paths_hakyll.version)
 
 
 --------------------------------------------------------------------------------
@@ -287,4 +289,3 @@ checkFileExists filePath = liftIO $ do
 --------------------------------------------------------------------------------
 stripFragments :: String -> String
 stripFragments = takeWhile (not . flip elem ['?', '#'])
-
